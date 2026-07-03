@@ -1,0 +1,101 @@
+import "dotenv/config";
+import type { Address } from "viem";
+import addressBookJson from "./addresses.json" with { type: "json" };
+
+type NetworkName = "local" | "sepolia" | "production";
+
+interface AddressEntry {
+  chainId: number;
+  network: string;
+  oracle: Address;
+  deployBlock: number;
+}
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required env var ${name} (see .env.example)`);
+  }
+  return value;
+}
+
+function parseBool(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  return value.toLowerCase() === "true" || value === "1";
+}
+
+function resolveOracleAddress(network: NetworkName, chainId: number): Address {
+  const envAddress = process.env.ORACLE_ADDRESS as Address | undefined;
+  if (envAddress && envAddress.toLowerCase() !== ZERO_ADDRESS) {
+    return envAddress;
+  }
+
+  const book = addressBookJson as unknown as Record<string, AddressEntry>;
+  const entry = network === "production" ? book.production : book[String(chainId)];
+
+  if (!entry || entry.oracle.toLowerCase() === ZERO_ADDRESS) {
+    throw new Error(
+      `No AgriOracle address configured for network="${network}" chainId=${chainId}. ` +
+        `Set ORACLE_ADDRESS in .env, or fill in src/addresses.json.`,
+    );
+  }
+  return entry.oracle;
+}
+
+export interface ReporterConfig {
+  privateKey: `0x${string}`;
+  rpcUrl: string;
+  chainId: number;
+  network: NetworkName;
+  oracleAddress: Address;
+  priceSourceUrl: string;
+  marketsApiUrl: string;
+  pollIntervalMs: number;
+  staleThresholdMs: number;
+  autoTopup: boolean;
+}
+
+let cached: ReporterConfig | null = null;
+
+/**
+ * Parses and validates env vars once, resolving the oracle address from
+ * ORACLE_ADDRESS or src/addresses.json. Throws on the first call if
+ * anything required is missing - fail fast, before a wallet gets loaded.
+ */
+export function loadConfig(): ReporterConfig {
+  if (cached) return cached;
+
+  const privateKey = requireEnv("REPORTER_PRIVATE_KEY") as `0x${string}`;
+  if (!privateKey.startsWith("0x") || privateKey.length !== 66) {
+    throw new Error("REPORTER_PRIVATE_KEY must be a 0x-prefixed 32-byte hex string");
+  }
+
+  const rpcUrl = requireEnv("RPC_URL");
+  const chainId = Number(requireEnv("CHAIN_ID"));
+  if (!Number.isInteger(chainId) || chainId <= 0) {
+    throw new Error("CHAIN_ID must be a positive integer");
+  }
+
+  const network = (process.env.NETWORK ?? "sepolia") as NetworkName;
+  if (!["local", "sepolia", "production"].includes(network)) {
+    throw new Error(`NETWORK must be one of local|sepolia|production, got "${network}"`);
+  }
+
+  const oracleAddress = resolveOracleAddress(network, chainId);
+
+  cached = {
+    privateKey,
+    rpcUrl,
+    chainId,
+    network,
+    oracleAddress,
+    priceSourceUrl: process.env.PRICE_SOURCE_URL ?? "",
+    marketsApiUrl: process.env.MARKETS_API_URL ?? "",
+    pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30_000),
+    staleThresholdMs: Number(process.env.STALE_PRICE_HOURS ?? 12) * 3600 * 1000,
+    autoTopup: parseBool(process.env.AUTO_TOPUP, false),
+  };
+  return cached;
+}

@@ -1,0 +1,21 @@
+{
+  "_comment": "Placeholder addresses. Fill these in after the AgriOracle pass-2 redeploy - deployBlock should be the block the contract was created in, used to bound event log queries.",
+  "31337": {
+    "chainId": 31337,
+    "network": "local",
+    "oracle": "0x0000000000000000000000000000000000000000",
+    "deployBlock": 0
+  },
+  "11155111": {
+    "chainId": 11155111,
+    "network": "sepolia",
+    "oracle": "0x0000000000000000000000000000000000000000",
+    "deployBlock": 0
+  },
+  "production": {
+    "chainId": 0,
+    "network": "production",
+    "oracle": "0x0000000000000000000000000000000000000000",
+    "deployBlock": 0
+  }
+}
