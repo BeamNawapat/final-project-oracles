@@ -107,6 +107,27 @@ Before you point your own price feed at production, understand what you're vouch
   opt in. Every CLI command that spends ETH prints the amount and asks for confirmation
   (`--yes` to skip, for scripting).
 
+## Auto-enroll (demo)
+
+`AUTO_ENROLL=true` makes the node self-register on startup instead of requiring the explicit
+`cli register` command - useful for a docker-compose demo where this node runs as a 4th
+reporter and should come up already staked. It runs once, after the abi-drift-guard
+domain-separator check and before the poll loop starts:
+
+- Not registered yet: registers with `AUTO_ENROLL_STAKE` ETH (falls back to the contract's
+  `MIN_STAKE` if unset, or if set below `MIN_STAKE`) plus `REGISTRATION_FEE`. First checks the
+  wallet balance covers that total plus a small gas buffer - if it doesn't, the node logs an
+  error and exits non-zero instead of looping unregistered.
+- Registered but under `ACTIVE_THRESHOLD` (e.g. after a slash): tops the stake back up to the
+  threshold so it can submit reports.
+- Registered and active: logs and continues straight into the poll loop.
+
+**This spends real ETH on first start** - at least `MIN_STAKE` (1 ETH) + `REGISTRATION_FEE`
+(0.01 ETH) = 1.01 ETH, more if `AUTO_ENROLL_STAKE` is set higher. `AUTO_ENROLL=false` is the
+default for exactly the reason `AUTO_TOPUP` is: this is a public node, and a node that spends a
+wallet's ETH without an explicit command is not a safe default. Only opt in when you control the
+wallet and mean for it to register unattended (e.g. a demo environment).
+
 ## Configuration reference
 
 See `.env.example` for the full list. The two you must fill in yourself, since this repo does

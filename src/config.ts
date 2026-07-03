@@ -55,6 +55,8 @@ export interface ReporterConfig {
   pollIntervalMs: number;
   staleThresholdMs: number;
   autoTopup: boolean;
+  autoEnroll: boolean;
+  autoEnrollStake?: string;
 }
 
 let cached: ReporterConfig | null = null;
@@ -96,6 +98,10 @@ export function loadConfig(): ReporterConfig {
     pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30_000),
     staleThresholdMs: Number(process.env.STALE_PRICE_HOURS ?? 12) * 3600 * 1000,
     autoTopup: parseBool(process.env.AUTO_TOPUP, false),
+    // Public-safety default is manual (`cli register`) - AUTO_ENROLL opts a node into
+    // self-registering on startup, for demo/docker-compose environments only.
+    autoEnroll: parseBool(process.env.AUTO_ENROLL, false),
+    autoEnrollStake: process.env.AUTO_ENROLL_STAKE || undefined,
   };
   return cached;
 }

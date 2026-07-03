@@ -1,8 +1,13 @@
+import { formatEther, parseEther } from "viem";
 import { getOracleClients, AgriOracleAbi } from "./oracle.js";
 import { loadConfig } from "./config.js";
 import { fetchScaledPrice, StalePriceError } from "./price-source.js";
 import { discoverReportableMarkets, type ReportableMarket } from "./markets.js";
 import { SIGNED_PRICE_TYPES, AGRI_ORACLE_DOMAIN } from "./abi/domain.js";
+
+// On top of stake + registration fee, require this much extra balance before
+// AUTO_ENROLL registers - leaves room for the registerReporter gas cost itself.
+const AUTO_ENROLL_GAS_BUFFER = parseEther("0.01");
 
 // Substrings of revert reasons that mean "nothing to do here", not "the
 // reporter is broken" - logged at info level and skipped rather than
@@ -97,6 +102,127 @@ async function ensureActive(clients: Awaited<ReturnType<typeof getOracleClients>
     return false;
   }
   return true;
+}
+
+/**
+ * Opt-in self-registration for AUTO_ENROLL=true nodes - e.g. a docker-compose demo
+ * running a 4th reporter that should come up already staked. Runs once at startup,
+ * after the abi-drift-guard domain-separator check (so we never sign/spend against a
+ * stale ABI) and before the poll loop starts. No-op when AUTO_ENROLL is unset, which
+ * keeps the public-node default manual (`cli register`).
+ *
+ * - Not registered: registers with AUTO_ENROLL_STAKE (falling back to on-chain
+ *   MIN_STAKE if unset or too low) + REGISTRATION_FEE, but only if the wallet can
+ *   cover that plus a gas buffer - an underfunded node exits rather than looping
+ *   unregistered.
+ * - Registered but under ACTIVE_THRESHOLD (e.g. after a slash): tops up to the
+ *   threshold so it can actually submit reports.
+ * - Registered and active: logs and returns.
+ */
+async function ensureEnrolled(clients: Awaited<ReturnType<typeof getOracleClients>>): Promise<void> {
+  const { publicClient, walletClient, account, config } = clients;
+  if (!config.autoEnroll) return;
+  const address = config.oracleAddress;
+
+  const [registered, stake] = (await publicClient.readContract({
+    address,
+    abi: AgriOracleAbi,
+    functionName: "getReporterInfo",
+    args: [account.address],
+  })) as [boolean, bigint, bigint, bigint, bigint];
+
+  const minStake = (await publicClient.readContract({
+    address,
+    abi: AgriOracleAbi,
+    functionName: "MIN_STAKE",
+  })) as bigint;
+
+  if (!registered) {
+    const registrationFee = (await publicClient.readContract({
+      address,
+      abi: AgriOracleAbi,
+      functionName: "REGISTRATION_FEE",
+    })) as bigint;
+
+    let desiredStake = minStake;
+    if (config.autoEnrollStake) {
+      const parsed = parseEther(config.autoEnrollStake);
+      if (parsed < minStake) {
+        console.warn(
+          `[reporter] AUTO_ENROLL_STAKE (${config.autoEnrollStake} ETH) is below MIN_STAKE ` +
+            `(${formatEther(minStake)} ETH) - using MIN_STAKE instead`,
+        );
+      } else {
+        desiredStake = parsed;
+      }
+    }
+
+    const total = desiredStake + registrationFee;
+    const required = total + AUTO_ENROLL_GAS_BUFFER;
+    const balance = await publicClient.getBalance({ address: account.address });
+
+    console.log(
+      `[reporter] AUTO_ENROLL: not registered - stake ${formatEther(desiredStake)} ETH + ` +
+        `registration fee ${formatEther(registrationFee)} ETH = ${formatEther(total)} ETH ` +
+        `(wallet balance ${formatEther(balance)} ETH)`,
+    );
+
+    if (balance < required) {
+      console.error(
+        `[reporter] AUTO_ENROLL: wallet balance ${formatEther(balance)} ETH is below the required ` +
+          `${formatEther(required)} ETH (stake + registration fee + gas buffer) - refusing to ` +
+          "register underfunded and exiting rather than looping unregistered",
+      );
+      process.exit(1);
+    }
+
+    const hash = await walletClient.writeContract({
+      address,
+      abi: AgriOracleAbi,
+      functionName: "registerReporter",
+      value: total,
+      chain: walletClient.chain,
+      account,
+    } as never);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") {
+      console.error(`[reporter] AUTO_ENROLL: registerReporter reverted (${hash}) - exiting`);
+      process.exit(1);
+    }
+    console.log(`[reporter] AUTO_ENROLL: registered (tx ${hash})`);
+    return;
+  }
+
+  const activeThreshold = (await publicClient.readContract({
+    address,
+    abi: AgriOracleAbi,
+    functionName: "ACTIVE_THRESHOLD",
+  })) as bigint;
+
+  if (stake >= activeThreshold) {
+    console.log(`[reporter] AUTO_ENROLL: already registered and active (stake ${formatEther(stake)} ETH)`);
+    return;
+  }
+
+  const topUp = activeThreshold - stake;
+  console.log(
+    `[reporter] AUTO_ENROLL: registered but stake ${formatEther(stake)} ETH is below ACTIVE_THRESHOLD ` +
+      `(${formatEther(activeThreshold)} ETH) - adding ${formatEther(topUp)} ETH`,
+  );
+  const hash = await walletClient.writeContract({
+    address,
+    abi: AgriOracleAbi,
+    functionName: "addStake",
+    value: topUp,
+    chain: walletClient.chain,
+    account,
+  } as never);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") {
+    console.error(`[reporter] AUTO_ENROLL: addStake top-up reverted (${hash}) - exiting`);
+    process.exit(1);
+  }
+  console.log(`[reporter] AUTO_ENROLL: stake topped up to active threshold (tx ${hash})`);
 }
 
 async function submitReportForMarket(
@@ -212,10 +338,14 @@ async function runCycle(): Promise<void> {
   }
 }
 
-export function startReporterLoop(): void {
+export async function startReporterLoop(): Promise<void> {
   const config = loadConfig();
   console.log(`[reporter] starting - polling every ${config.pollIntervalMs / 1000}s`);
   console.log(`[reporter] network=${config.network} chainId=${config.chainId} oracle=${config.oracleAddress}`);
+
+  // Runs the abi-drift-guard domain-separator check before anything else.
+  const clients = await getOracleClients();
+  await ensureEnrolled(clients);
 
   void runCycle();
   setInterval(() => void runCycle(), config.pollIntervalMs);
@@ -223,5 +353,8 @@ export function startReporterLoop(): void {
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  startReporterLoop();
+  startReporterLoop().catch((err) => {
+    console.error("[reporter] startup failed:", (err as Error).message);
+    process.exit(1);
+  });
 }
