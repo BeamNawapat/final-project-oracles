@@ -15,4 +15,6 @@ COPY --from=build /app/dist ./dist
 
 # REPORTER_PRIVATE_KEY and the rest of .env.example must be supplied at
 # runtime (docker run --env-file .env ...) - never baked into the image.
-CMD ["node", "dist/reporter.js"]
+# --import loads otel-init.js before reporter.js so the OTel SDK (opt-in,
+# see src/otel-init.ts) is registered before any span/log could be emitted.
+CMD ["node", "--import", "./dist/otel-init.js", "dist/reporter.js"]
