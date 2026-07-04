@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { fetchScaledPrice, StalePriceError } from "./price-source.js";
 import { discoverReportableMarkets, type ReportableMarket } from "./markets.js";
 import { SIGNED_PRICE_TYPES, AGRI_ORACLE_DOMAIN } from "./abi/domain.js";
+import { traceSpan } from "./otel-init.js";
 
 // On top of stake + registration fee, require this much extra balance before
 // AUTO_ENROLL registers - leaves room for the registerReporter gas cost itself.
@@ -236,7 +237,11 @@ async function submitReportForMarket(
 
   let price;
   try {
-    price = await fetchScaledPrice(market.productCode);
+    price = await traceSpan(
+      "reporter.fetch_price",
+      () => fetchScaledPrice(market.productCode),
+      { productCode: market.productCode },
+    );
   } catch (err) {
     if (err instanceof StalePriceError) {
       console.warn(`[reporter] skipping ${market.productCode}: ${err.message}`);
@@ -282,24 +287,29 @@ async function submitReportForMarket(
   });
 
   try {
-    const hash = await walletClient.writeContract({
-      address,
-      abi: AgriOracleAbi,
-      functionName: "submitReport",
-      args: [
-        market.questionId,
-        market.productCode,
-        price.priceMin,
-        price.priceMax,
-        price.sourceDate,
-        expiryTime,
-        nonce,
-        signature,
-      ],
-      value: reportBond,
-      chain: walletClient.chain,
-      account,
-    } as never);
+    const hash = await traceSpan(
+      "reporter.submit_report",
+      () =>
+        walletClient.writeContract({
+          address,
+          abi: AgriOracleAbi,
+          functionName: "submitReport",
+          args: [
+            market.questionId,
+            market.productCode,
+            price.priceMin,
+            price.priceMax,
+            price.sourceDate,
+            expiryTime,
+            nonce,
+            signature,
+          ],
+          value: reportBond,
+          chain: walletClient.chain,
+          account,
+        } as never),
+      { productCode: market.productCode, questionId: market.questionId },
+    );
 
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") {
@@ -323,14 +333,16 @@ async function runCycle(): Promise<void> {
   if (cycleRunning) return;
   cycleRunning = true;
   try {
-    const clients = await getOracleClients();
+    await traceSpan("reporter.cycle", async () => {
+      const clients = await getOracleClients();
 
-    if (!(await ensureActive(clients))) return;
+      if (!(await ensureActive(clients))) return;
 
-    const markets = await discoverReportableMarkets();
-    for (const market of markets) {
-      await submitReportForMarket(clients, market);
-    }
+      const markets = await discoverReportableMarkets();
+      for (const market of markets) {
+        await submitReportForMarket(clients, market);
+      }
+    });
   } catch (err) {
     console.error("[reporter] cycle error:", (err as Error).message);
   } finally {
