@@ -6,6 +6,8 @@ import {
   context as apiContext,
   SpanStatusCode,
   type Tracer,
+  type Histogram,
+  type Counter,
 } from "@opentelemetry/api";
 import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
@@ -146,15 +148,13 @@ export async function traceSpan<T>(
 // call below is a guarded no-op when tracing is off.
 // ============================================
 
-const meter = metrics.getMeter(SERVICE_NAME);
-
-const cycleDurationMs = meter.createHistogram("agricast.reporter.cycle.duration_ms", {
-  description: "Duration of one reporter.cycle run (poll + report every reportable market)",
-  unit: "ms",
-});
-const reportsSubmittedCounter = meter.createCounter("agricast.reporter.reports_submitted", {
-  description: "Count of price reports this reporter node successfully submitted on-chain",
-});
+// Not created here (unlike the harmless no-op tracer above): metrics.getMeter()
+// is eager, not a lazy proxy, so calling it before setGlobalMeterProvider()
+// binds these permanently to the no-op meter and no metric ever reaches the
+// exporter. Created inside initOtel() instead, right after the provider is
+// registered - mirrors otelLogger's null-then-assign pattern above.
+let cycleDurationMs: Histogram | null = null;
+let reportsSubmittedCounter: Counter | null = null;
 
 /** Record a reporter.cycle duration (ms). No-op when tracing is disabled. */
 export function recordCycleDuration(
@@ -162,7 +162,7 @@ export function recordCycleDuration(
   attributes: Record<string, string | number | boolean> = {},
 ): void {
   if (!isOtelEnabled()) return;
-  cycleDurationMs.record(ms, attributes);
+  cycleDurationMs?.record(ms, attributes);
 }
 
 /** Increment the reports-submitted counter. No-op when tracing is disabled. */
@@ -171,7 +171,7 @@ export function incrementReportsSubmitted(
   attributes: Record<string, string | number | boolean> = {},
 ): void {
   if (!isOtelEnabled()) return;
-  reportsSubmittedCounter.add(value, attributes);
+  reportsSubmittedCounter?.add(value, attributes);
 }
 
 const CONSOLE_SEVERITY = {
@@ -254,6 +254,15 @@ function initOtel(): void {
     ],
   });
   metrics.setGlobalMeterProvider(meterProvider);
+
+  const meter = metrics.getMeter(SERVICE_NAME);
+  cycleDurationMs = meter.createHistogram("agricast.reporter.cycle.duration_ms", {
+    description: "Duration of one reporter.cycle run (poll + report every reportable market)",
+    unit: "ms",
+  });
+  reportsSubmittedCounter = meter.createCounter("agricast.reporter.reports_submitted", {
+    description: "Count of price reports this reporter node successfully submitted on-chain",
+  });
 
   // Covers both plain outbound fetch (price-source.ts, markets.ts) and
   // viem's http() transport, which also runs on Node's built-in fetch/undici
