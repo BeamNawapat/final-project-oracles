@@ -4,7 +4,7 @@ import { loadConfig } from "./config.js";
 import { fetchScaledPrice, StalePriceError } from "./price-source.js";
 import { discoverReportableMarkets, type ReportableMarket } from "./markets.js";
 import { SIGNED_PRICE_TYPES, AGRI_ORACLE_DOMAIN } from "./abi/domain.js";
-import { traceSpan } from "./otel-init.js";
+import { traceSpan, recordCycleDuration, incrementReportsSubmitted } from "./otel-init.js";
 
 // On top of stake + registration fee, require this much extra balance before
 // AUTO_ENROLL registers - leaves room for the registerReporter gas cost itself.
@@ -317,6 +317,7 @@ async function submitReportForMarket(
       return;
     }
     console.log(`[reporter] submitted ${market.productCode} for ${market.questionId} (tx ${hash})`);
+    incrementReportsSubmitted(1, { productCode: market.productCode });
   } catch (err) {
     const message = (err as Error).message ?? String(err);
     if (isExpectedRevert(message)) {
@@ -332,6 +333,7 @@ let cycleRunning = false;
 async function runCycle(): Promise<void> {
   if (cycleRunning) return;
   cycleRunning = true;
+  const startedAt = Date.now();
   try {
     await traceSpan("reporter.cycle", async () => {
       const clients = await getOracleClients();
@@ -346,6 +348,7 @@ async function runCycle(): Promise<void> {
   } catch (err) {
     console.error("[reporter] cycle error:", (err as Error).message);
   } finally {
+    recordCycleDuration(Date.now() - startedAt);
     cycleRunning = false;
   }
 }
