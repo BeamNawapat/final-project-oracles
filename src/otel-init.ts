@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   trace,
+  metrics,
   context as apiContext,
   SpanStatusCode,
   type Tracer,
@@ -11,16 +12,18 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { LoggerProvider, BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { logs, SeverityNumber, type Logger as OtelLogger } from "@opentelemetry/api-logs";
+import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
+import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { registerInstrumentations } from "@opentelemetry/instrumentation";
 import { UndiciInstrumentation } from "@opentelemetry/instrumentation-undici";
 
 /**
- * Opt-in OTLP traces + logs for this standalone reporter, against the same
- * self-hosted SigNoz collector the backend points at (backend/src/lib/otel.ts)
- * - same env-var switch, keyless by default. This service isn't an Elysia
- * app so it can't reuse @elysiajs/opentelemetry; it wires the Node SDK
- * directly instead.
+ * Opt-in OTLP traces + logs + metrics for this standalone reporter, against
+ * the same self-hosted SigNoz collector the backend points at
+ * (backend/src/lib/otel.ts) - same env-var switch, keyless by default. This
+ * service isn't an Elysia app so it can't reuse @elysiajs/opentelemetry; it
+ * wires the Node SDK directly instead.
  *
  * Load this FIRST, before reporter.ts - via
  * `node --import ./dist/otel-init.js dist/reporter.js` (see Dockerfile CMD).
@@ -31,11 +34,12 @@ import { UndiciInstrumentation } from "@opentelemetry/instrumentation-undici";
  * Env:
  *   OTEL_ENABLED=true                 - explicit on/off switch
  *   OTEL_EXPORTER_OTLP_ENDPOINT=...    - collector base URL, e.g.
- *                                        http://localhost:4318 (NOT the full
- *                                        /v1/traces path - unlike the
- *                                        backend's single-signal var, this
- *                                        one is a base that both traces and
- *                                        logs append their own path onto).
+ *                                        http://localhost:4318 - a bare base,
+ *                                        NOT a full /v1/traces path. Traces,
+ *                                        logs, and metrics each append their
+ *                                        own /v1/... path below (same
+ *                                        convention backend/src/lib/otel.ts
+ *                                        uses via its otlpBase() helper).
  *                                        Setting this without OTEL_ENABLED
  *                                        also turns things on (see
  *                                        isOtelEnabled below).
@@ -44,6 +48,12 @@ import { UndiciInstrumentation } from "@opentelemetry/instrumentation-undici";
  *                                        Omit for a local collector with no
  *                                        auth - this deploy is keyless.
  *   OTEL_SERVICE_NAME=agricast-oracle-reporter - resource service.name
+ *
+ * Metrics: agricast.reporter.cycle.duration_ms (histogram, one poll-and-report
+ * cycle's wall time) and agricast.reporter.reports_submitted (counter,
+ * incremented once per successful on-chain submitReport) - agricast.* prefix
+ * to match backend's instrument naming (agricast.order_match.duration_ms,
+ * agricast.oracle.reports_submitted, etc). See the Metrics section below.
  *
  * Logs: reporter.ts and friends log via plain console.log/warn/error
  * prefixed "[reporter]" - rewriting every call site to a structured logger
@@ -129,6 +139,41 @@ export async function traceSpan<T>(
   });
 }
 
+// ============================================
+// Metrics - two instruments covering the reporter's own on-chain activity,
+// mirroring backend/src/lib/otel.ts's counter/histogram pattern. Cheap:
+// instrument creation is idempotent per name, and every record/increment
+// call below is a guarded no-op when tracing is off.
+// ============================================
+
+const meter = metrics.getMeter(SERVICE_NAME);
+
+const cycleDurationMs = meter.createHistogram("agricast.reporter.cycle.duration_ms", {
+  description: "Duration of one reporter.cycle run (poll + report every reportable market)",
+  unit: "ms",
+});
+const reportsSubmittedCounter = meter.createCounter("agricast.reporter.reports_submitted", {
+  description: "Count of price reports this reporter node successfully submitted on-chain",
+});
+
+/** Record a reporter.cycle duration (ms). No-op when tracing is disabled. */
+export function recordCycleDuration(
+  ms: number,
+  attributes: Record<string, string | number | boolean> = {},
+): void {
+  if (!isOtelEnabled()) return;
+  cycleDurationMs.record(ms, attributes);
+}
+
+/** Increment the reports-submitted counter. No-op when tracing is disabled. */
+export function incrementReportsSubmitted(
+  value = 1,
+  attributes: Record<string, string | number | boolean> = {},
+): void {
+  if (!isOtelEnabled()) return;
+  reportsSubmittedCounter.add(value, attributes);
+}
+
 const CONSOLE_SEVERITY = {
   log: { number: SeverityNumber.INFO, text: "INFO" },
   warn: { number: SeverityNumber.WARN, text: "WARN" },
@@ -170,7 +215,15 @@ function initOtel(): void {
   const resource = resourceFromAttributes({
     "service.name": SERVICE_NAME,
     "service.version": readServiceVersion(),
-    "deployment.environment": process.env.NODE_ENV || "development",
+    // Default to "production" (not "development") to match backend's
+    // buildResource() - an unset NODE_ENV shouldn't split this service into
+    // its own SigNoz environment away from everything else.
+    "deployment.environment": process.env.NODE_ENV || "production",
+    // New-semconv key, alongside the legacy one above - most current SigNoz
+    // dashboards/collector configs still filter on "deployment.environment"
+    // rather than this newer ".name" form, so both are set to the same
+    // value (same convention backend/src/lib/otel.ts uses).
+    "deployment.environment.name": process.env.NODE_ENV || "production",
     "service.instance.id": process.env.GIT_COMMIT || "unknown",
   });
 
@@ -191,6 +244,17 @@ function initOtel(): void {
   logs.setGlobalLoggerProvider(loggerProvider);
   otelLogger = logs.getLogger(SERVICE_NAME);
 
+  const meterProvider = new MeterProvider({
+    resource,
+    readers: [
+      new PeriodicExportingMetricReader({
+        exporter: new OTLPMetricExporter({ url: `${base}/v1/metrics`, headers }),
+        exportIntervalMillis: 30_000,
+      }),
+    ],
+  });
+  metrics.setGlobalMeterProvider(meterProvider);
+
   // Covers both plain outbound fetch (price-source.ts, markets.ts) and
   // viem's http() transport, which also runs on Node's built-in fetch/undici
   // - one instrumentation gets both the price/markets API calls and the RPC
@@ -201,11 +265,15 @@ function initOtel(): void {
 
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
     process.once(signal, () => {
-      void Promise.allSettled([tracerProvider.shutdown(), loggerProvider.shutdown()]);
+      void Promise.allSettled([
+        tracerProvider.shutdown(),
+        loggerProvider.shutdown(),
+        meterProvider.shutdown(),
+      ]);
     });
   }
 
-  console.log(`[otel] traces+logs enabled -> ${base} (service=${SERVICE_NAME})`);
+  console.log(`[otel] traces+logs+metrics enabled -> ${base} (service=${SERVICE_NAME})`);
 }
 
 initOtel();
