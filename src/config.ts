@@ -96,7 +96,12 @@ export function loadConfig(): ReporterConfig {
     priceSourceUrl: process.env.PRICE_SOURCE_URL ?? "",
     marketsApiUrl: process.env.MARKETS_API_URL ?? "",
     pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30_000),
-    staleThresholdMs: Number(process.env.STALE_PRICE_HOURS ?? 12) * 3600 * 1000,
+    // MOC (Thai Ministry of Commerce) price rows are dated midnight-UTC and MOC
+    // publishes with a lag - fresh data can already read ~15h old by evening
+    // Bangkok time, and normal publish lag reaches ~2 days. A 12h default caused
+    // false "skipping ... older than STALE_PRICE_HOURS" skips, so the fallback
+    // is 48h here. Still fully overridable via STALE_PRICE_HOURS.
+    staleThresholdMs: Number(process.env.STALE_PRICE_HOURS ?? 48) * 3600 * 1000,
     autoTopup: parseBool(process.env.AUTO_TOPUP, false),
     // Public-safety default is manual (`cli register`) - AUTO_ENROLL opts a node into
     // self-registering on startup, for demo/docker-compose environments only.
