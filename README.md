@@ -9,12 +9,13 @@ instance (different keys) if you want to operate several reporters.
 
 ## What this does NOT do
 
-This node has no access to AgriCast's internal database or scraper. It fetches prices from a
-URL you configure (`PRICE_SOURCE_URL`) and discovers reportable markets from a second URL you
-configure (`MARKETS_API_URL`). Point those at whatever data sources you trust - your own
-scraper, a public commodity price API, a subgraph over the factory's events. The contract does
-not care where your data comes from; it only cares whether your reported price agrees with the
-stake-weighted median of everyone else's.
+This node has no access to AgriCast's internal database. For prices, it scrapes
+data.moc.go.th (Thailand's Ministry of Commerce) itself via `src/moc-scraper.ts` - an
+independent read, not a trust-the-backend relay - falling back to a URL you configure
+(`PRICE_SOURCE_URL`) only if that direct scrape fails or is disabled. It discovers reportable
+markets from a second URL you configure (`MARKETS_API_URL`). The contract does not care where
+your data comes from; it only cares whether your reported price agrees with the stake-weighted
+median of everyone else's.
 
 ## Quickstart
 
@@ -130,12 +131,18 @@ wallet and mean for it to register unattended (e.g. a demo environment).
 
 ## Configuration reference
 
-See `.env.example` for the full list. The two you must fill in yourself, since this repo does
-not ship them:
+See `.env.example` for the full list. Price data comes from two layers:
 
-- `PRICE_SOURCE_URL` - `GET {url}?productCode=<code>` must return
+- `MOC_ENABLED` (default `true`), `MOC_BASE_URL`, `MOC_REQUEST_TIMEOUT_MS`, `MOC_SCRAPE_ATTEMPTS`
+  - the primary source. `src/moc-scraper.ts` drives headless Chromium against
+  `data.moc.go.th/OpenData/GISProductPrice` for the given product, same site the backend's own
+  scraper uses, and returns the latest available day. Requires Chromium in the image (installed
+  by the `Dockerfile`).
+- `PRICE_SOURCE_URL` - the fallback. Used only if the direct MOC scrape errors, times out, or
+  `MOC_ENABLED=false`. `GET {url}?productCode=<code>` must return
   `{ "productCode": "...", "priceMin": number, "priceMax": number, "date": "ISO-8601" }`.
-- `MARKETS_API_URL` - `GET {url}` must return
+- `MARKETS_API_URL` - you must fill this in yourself, since this repo does not ship it.
+  `GET {url}` must return
   `[{ "questionId": "0x...", "productCode": "...", "resolutionTime": "ISO-8601" }, ...]`.
 
 `ORACLE_ADDRESS` in `.env` overrides `src/addresses.json` - fill in whichever one is convenient

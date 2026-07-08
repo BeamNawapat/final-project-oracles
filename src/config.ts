@@ -57,6 +57,10 @@ export interface ReporterConfig {
   autoTopup: boolean;
   autoEnroll: boolean;
   autoEnrollStake?: string;
+  mocEnabled: boolean;
+  mocBaseUrl: string;
+  mocRequestTimeoutMs: number;
+  mocScrapeAttempts: number;
 }
 
 let cached: ReporterConfig | null = null;
@@ -107,6 +111,14 @@ export function loadConfig(): ReporterConfig {
     // self-registering on startup, for demo/docker-compose environments only.
     autoEnroll: parseBool(process.env.AUTO_ENROLL, false),
     autoEnrollStake: process.env.AUTO_ENROLL_STAKE || undefined,
+    // Direct-MOC scrape is the primary price source (see src/moc-scraper.ts);
+    // PRICE_SOURCE_URL (the backend feed) is the fallback if it errors/times
+    // out. Set MOC_ENABLED=false to skip straight to the backend feed (e.g.
+    // if MOC is blocking the reporter's IP).
+    mocEnabled: parseBool(process.env.MOC_ENABLED, true),
+    mocBaseUrl: process.env.MOC_BASE_URL ?? "https://data.moc.go.th/OpenData/GISProductPrice",
+    mocRequestTimeoutMs: Number(process.env.MOC_REQUEST_TIMEOUT_MS ?? 90_000),
+    mocScrapeAttempts: Number(process.env.MOC_SCRAPE_ATTEMPTS ?? 3),
   };
   return cached;
 }

@@ -11,6 +11,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
+
+# Install Chromium for the direct-MOC scraper (src/moc-scraper.ts). Bloats
+# this slim image (~400MB+) but the reporter must be able to scrape MOC
+# itself instead of depending on the backend's /public/price feed.
+RUN npx playwright install --with-deps chromium
+
 COPY --from=build /app/dist ./dist
 
 # REPORTER_PRIVATE_KEY and the rest of .env.example must be supplied at
