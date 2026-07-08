@@ -33,6 +33,18 @@ const formatDate = (d: Date): string => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// productCode comes from MARKETS_API_URL (an external, untrusted feed - see
+// price-source.ts) and is interpolated into both a request URL and a temp
+// file path. Reject anything outside a plain alphanumeric/-/_ token before
+// it reaches either, closing off query injection and path traversal.
+const PRODUCT_CODE_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+function assertValidProductCode(productCode: string): void {
+  if (!PRODUCT_CODE_RE.test(productCode)) {
+    throw new Error(`Invalid productCode "${productCode}": must match ${PRODUCT_CODE_RE}`);
+  }
+}
+
 export interface MocPriceRecord {
   date: string; // YYYY-MM-DD
   priceMax: number;
@@ -143,17 +155,22 @@ function parseDownloadedCsv(content: string): MocPriceRecord[] {
 }
 
 async function scrapeOnce(productCode: string): Promise<MocQuote> {
+  assertValidProductCode(productCode);
+
   const config = loadConfig();
   const toDate = formatDate(new Date());
   const to = new Date(toDate);
   const fromDate = formatDate(new Date(to.getFullYear(), to.getMonth() - 1, 1));
-  const searchUrl = `${config.mocBaseUrl}?product_id=${productCode}&from_date=${fromDate}&to_date=${toDate}&task=search`;
+  const searchUrl = new URL(config.mocBaseUrl);
+  searchUrl.searchParams.set("product_id", productCode);
+  searchUrl.searchParams.set("from_date", fromDate);
+  searchUrl.searchParams.set("to_date", toDate);
+  searchUrl.searchParams.set("task", "search");
 
   const browser = await chromium.launch({
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
       "--disable-dev-shm-usage",
     ],
   });
@@ -171,7 +188,7 @@ async function scrapeOnce(productCode: string): Promise<MocQuote> {
 
     const page = await context.newPage();
     try {
-      await page.goto(searchUrl, {
+      await page.goto(searchUrl.toString(), {
         timeout: config.mocRequestTimeoutMs,
         waitUntil: "domcontentloaded",
       });
@@ -195,26 +212,31 @@ async function scrapeOnce(productCode: string): Promise<MocQuote> {
       await page.click('a[href="javascript:exportAsCSV();"]');
       const download = await downloadPromise;
 
-      const csvPath = path.join(
-        await fs.promises.mkdtemp(path.join(os.tmpdir(), "moc-")),
-        `${productCode}.csv`,
-      );
-      await download.saveAs(csvPath);
-      const content = await fs.promises.readFile(csvPath, "utf-8");
-      await fs.promises.unlink(csvPath).catch(() => {});
+      // Fixed basename (productCode is already allowlist-validated above,
+      // but keep the temp filename constant regardless) inside a unique
+      // per-scrape dir, which we remove wholesale in the finally below so
+      // the daemon doesn't leak empty dirs into os.tmpdir() forever.
+      const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "moc-"));
+      try {
+        const csvPath = path.join(tmpDir, "quote.csv");
+        await download.saveAs(csvPath);
+        const content = await fs.promises.readFile(csvPath, "utf-8");
 
-      const records = parseDownloadedCsv(content);
-      if (records.length <= MIN_RECORDS_EXPECTED) {
-        throw new Error(`MOC CSV for ${productCode} had no parseable rows`);
+        const records = parseDownloadedCsv(content);
+        if (records.length <= MIN_RECORDS_EXPECTED) {
+          throw new Error(`MOC CSV for ${productCode} had no parseable rows`);
+        }
+
+        const latest = records.reduce((a, b) => (a.date > b.date ? a : b));
+        return {
+          productCode,
+          priceMin: latest.priceMin,
+          priceMax: latest.priceMax,
+          date: `${latest.date}T00:00:00Z`,
+        };
+      } finally {
+        await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       }
-
-      const latest = records.reduce((a, b) => (a.date > b.date ? a : b));
-      return {
-        productCode,
-        priceMin: latest.priceMin,
-        priceMax: latest.priceMax,
-        date: `${latest.date}T00:00:00Z`,
-      };
     } finally {
       await page.close();
     }
@@ -232,16 +254,28 @@ export async function scrapeMocProduct(productCode: string): Promise<MocQuote> {
   const config = loadConfig();
   let lastError: Error | null = null;
 
+  // Cap the total wall-clock spend across all retries to one request
+  // timeout's worth. Without this, mocScrapeAttempts (default 3) x
+  // mocRequestTimeoutMs (default 90s) each lets a single stuck-but-slow
+  // MOC response stall a market for ~4.5 minutes every 30s poll cycle -
+  // this bounds it to a single timeout window before falling back.
+  const deadline = Date.now() + config.mocRequestTimeoutMs;
+
   for (let attempt = 1; attempt <= config.mocScrapeAttempts; attempt++) {
     try {
       return await scrapeOnce(productCode);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (attempt < config.mocScrapeAttempts) {
+      if (attempt < config.mocScrapeAttempts && Date.now() < deadline) {
         console.warn(
           `[moc-scraper] ${productCode} attempt ${attempt}/${config.mocScrapeAttempts} failed (${lastError.message}); retrying`,
         );
         await sleep(2000 + Math.random() * 3000);
+      } else if (attempt < config.mocScrapeAttempts) {
+        console.warn(
+          `[moc-scraper] ${productCode} giving up after ${attempt}/${config.mocScrapeAttempts} attempts - time budget exhausted`,
+        );
+        break;
       }
     }
   }

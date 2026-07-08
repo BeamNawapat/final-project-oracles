@@ -19,6 +19,15 @@ RUN npx playwright install --with-deps chromium
 
 COPY --from=build /app/dist ./dist
 
+# Run as a dedicated non-root user. The scraper renders untrusted remote
+# content (data.moc.go.th) with Chromium's sandbox now enabled (the
+# --no-sandbox launch arg was removed from moc-scraper.ts) - a renderer
+# exploit must not also get root on the container, since REPORTER_PRIVATE_KEY
+# lives in this same process's env.
+RUN groupadd --system reporter && useradd --system --gid reporter --create-home reporter \
+  && chown -R reporter:reporter /app
+USER reporter
+
 # REPORTER_PRIVATE_KEY and the rest of .env.example must be supplied at
 # runtime (docker run --env-file .env ...) - never baked into the image.
 # --import loads otel-init.js before reporter.js so the OTel SDK (opt-in,

@@ -36,6 +36,12 @@ function toScaledUnits(value: number): bigint {
 
 export class StalePriceError extends Error {}
 
+// Distinct from a plain scrape/network failure so fetchScaledPrice can
+// refuse to fall back to the backend feed on this class of error - the
+// backend feed is itself MOC-derived, so silently retrying it would just
+// launder the same implausible value instead of surfacing the problem.
+export class ImplausiblePriceError extends Error {}
+
 async function fetchFromBackend(productCode: string): Promise<PriceQuote> {
   const config = loadConfig();
   if (!config.priceSourceUrl) {
@@ -70,8 +76,45 @@ async function fetchFromMoc(productCode: string): Promise<PriceQuote> {
  * the reporter's own staleness window should be tighter so it doesn't sign
  * data nobody wants.
  */
+/**
+ * Bounds check for a raw (un-scaled) price. Neither source is trusted -
+ * the direct MOC scrape renders attacker-reachable remote content
+ * (data.moc.go.th) and the backend feed is itself MOC-derived - so a
+ * malformed CSV row, a MITM'd response, or a compromised MOC endpoint
+ * must not be able to push an arbitrary value through to an on-chain,
+ * bonded-reporter-signed submission. Product prices are THB/kg-scale;
+ * anything outside this band is rejected rather than silently trusted.
+ */
+const MAX_PLAUSIBLE_PRICE = 1_000_000; // THB/kg - generous upper bound, still far below overflow/garbage territory
+
+function assertPlausiblePrice(quote: PriceQuote): void {
+  const { priceMin, priceMax, productCode } = quote;
+  if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) {
+    throw new ImplausiblePriceError(
+      `Price source returned a non-finite price for ${productCode}: min=${priceMin} max=${priceMax}`,
+    );
+  }
+  if (priceMin <= 0 || priceMax <= 0) {
+    throw new ImplausiblePriceError(
+      `Price source returned a non-positive price for ${productCode}: min=${priceMin} max=${priceMax}`,
+    );
+  }
+  if (priceMin > priceMax) {
+    throw new ImplausiblePriceError(
+      `Price source returned priceMin > priceMax for ${productCode}: min=${priceMin} max=${priceMax}`,
+    );
+  }
+  if (priceMin > MAX_PLAUSIBLE_PRICE || priceMax > MAX_PLAUSIBLE_PRICE) {
+    throw new ImplausiblePriceError(
+      `Price source returned an implausible price for ${productCode}: min=${priceMin} max=${priceMax} (> ${MAX_PLAUSIBLE_PRICE})`,
+    );
+  }
+}
+
 function toScaledPrice(quote: PriceQuote): ScaledPrice {
   const config = loadConfig();
+
+  assertPlausiblePrice(quote);
 
   const sourceDateMs = new Date(quote.date).getTime();
   if (Number.isNaN(sourceDateMs)) {
@@ -112,6 +155,12 @@ export async function fetchScaledPrice(productCode: string): Promise<ScaledPrice
       const quote = await fetchFromMoc(productCode);
       return toScaledPrice(quote);
     } catch (err) {
+      // An implausible price is not a transient scrape/network failure -
+      // falling back would just ask the (also MOC-derived) backend feed
+      // to launder the same bad value. Surface it and skip this market.
+      if (err instanceof ImplausiblePriceError) {
+        throw err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       console.warn(
         `[price-source] direct MOC scrape failed for ${productCode} (${message}); falling back to backend feed`,

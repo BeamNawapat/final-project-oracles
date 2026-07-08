@@ -1,7 +1,7 @@
 import { formatEther, parseEther } from "viem";
 import { getOracleClients, AgriOracleAbi } from "./oracle.js";
 import { loadConfig } from "./config.js";
-import { fetchScaledPrice, StalePriceError } from "./price-source.js";
+import { fetchScaledPrice, ImplausiblePriceError, StalePriceError } from "./price-source.js";
 import { discoverReportableMarkets, type ReportableMarket } from "./markets.js";
 import { SIGNED_PRICE_TYPES, AGRI_ORACLE_DOMAIN } from "./abi/domain.js";
 import { traceSpan, recordCycleDuration, incrementReportsSubmitted } from "./otel-init.js";
@@ -245,6 +245,8 @@ async function submitReportForMarket(
   } catch (err) {
     if (err instanceof StalePriceError) {
       console.warn(`[reporter] skipping ${market.productCode}: ${err.message}`);
+    } else if (err instanceof ImplausiblePriceError) {
+      console.error(`[reporter] skipping ${market.productCode}: implausible price rejected - ${err.message}`);
     } else {
       console.warn(`[reporter] price fetch failed for ${market.productCode}: ${(err as Error).message}`);
     }
