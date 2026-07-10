@@ -6,11 +6,15 @@
  * so any drift produces a signature that recovers to the wrong address and
  * every submitReport call reverts with "Invalid signature".
  *
- * Source of truth (contracts/src/core/AgriOracle.sol):
- *   bytes32 public constant PRICE_TYPEHASH = keccak256(
- *       "SignedPrice(bytes32 questionId,string productCode,uint256 priceMin,uint256 priceMax,uint256 sourceDate,uint256 expiryTime,uint256 nonce)"
- *   );
- *   constructor(...) EIP712("AgriOracle", "1") { ... }
+ * Source of truth - AgriOracle is now an EIP-2535 diamond (contracts/src/oracle/):
+ *   contracts/src/oracle/libraries/OracleConstants.sol:
+ *     bytes32 internal constant PRICE_TYPEHASH = keccak256(
+ *         "SignedPrice(bytes32 questionId,string productCode,uint256 priceMin,uint256 priceMax,uint256 sourceDate,uint256 expiryTime,uint256 nonce)"
+ *     );
+ *   contracts/src/oracle/libraries/LibEIP712.sol: domain ("AgriOracle", "1"), rebuilt from
+ *     address(this)/block.chainid on every call instead of cached at construction - so
+ *     `verifyingContract` always resolves to the diamond's address under delegatecall, byte-
+ *     identical to the original OZ EIP712("AgriOracle", "1") digest this replaced.
  *
  * questionId is FIRST (binds a signed price to one specific market) and
  * nonce is LAST (lets a reporter invalidate outstanding signatures via

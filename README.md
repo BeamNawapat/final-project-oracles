@@ -57,9 +57,11 @@ Use a testnet (Sepolia) first. Do not point a fresh reporter at production witho
 
 ## Economics
 
-Values below are the contract's constants (`contracts/src/core/AgriOracle.sol`) as of this
-repo's ABI snapshot - `npm run cli status` also prints your live on-chain numbers so you never
-have to trust these being current.
+AgriOracle is an EIP-2535 diamond: one permanent proxy address routes calls to swappable
+facets, so `ORACLE_ADDRESS` never changes across a facet upgrade. Values below are the
+contract's constants (`contracts/src/oracle/libraries/OracleConstants.sol`, read through
+`OracleViewFacet`) as of this repo's ABI snapshot - `npm run cli status` also prints your live
+on-chain numbers so you never have to trust these being current.
 
 | Constant | Value | Meaning |
 |---|---|---|
@@ -146,8 +148,21 @@ See `.env.example` for the full list. Price data comes from two layers:
   `[{ "questionId": "0x...", "productCode": "...", "resolutionTime": "ISO-8601" }, ...]`.
 
 `ORACLE_ADDRESS` in `.env` overrides `src/addresses.json` - fill in whichever one is convenient
-for your setup. Both ship with placeholder `0x0...0` addresses; you must fill them in after the
-contract redeploy you're targeting.
+for your setup. Both ship with placeholder `0x0...0` addresses; you must fill them in with the
+diamond's permanent proxy address after the deploy you're targeting. If you fill in
+`src/addresses.json` instead, also set `deployBlock` to the diamond's creation block (see the
+comment in that file) - it bounds reporter event-log queries, so a stale value causes missed or
+over-scanned events.
+
+## Joining as a reporter (permissionless)
+
+Registration is open to anyone: `registerReporter` carries no role restriction under the
+protocol's AccessManager (all reporter-lifecycle calls - register, add/withdraw stake,
+unregister, claim, invalidate-nonce - are `PUBLIC_ROLE` by default, unassigned to any of the
+gated roles like `RESOLVER`/`REGISTRAR`/`APP_ADMIN`). There is no allowlist and no admin
+approval step - stake `MIN_STAKE` + `REGISTRATION_FEE` (1.01 ETH at current constants) via
+`cli register` and you're in. Only the state-changing admin/resolver/dispute-resolution paths
+are role-gated; nothing on the join path is.
 
 ## abi-drift-guard
 
